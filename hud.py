@@ -1,0 +1,865 @@
+"""Ledger of Claude Code sessions as open loops: what needs me, what's detached, what's done."""
+
+import argparse
+import contextlib
+import io
+import json
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import vscode_bridge
+import winplatform
+
+DB_PATH = Path(os.environ.get("HUD_DB", Path.home() / ".claude/hud/hud.db"))
+TOKEN_PATH = DB_PATH.parent / "token"
+BOARD_URL = "http://localhost:7777"
+PROJECTS = Path.home() / ".claude/projects"
+LIVE_STATES = ("working", "waiting", "idle")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS items (
+    session_id       TEXT PRIMARY KEY,
+    cwd              TEXT,
+    transcript_path  TEXT,
+    git_branch       TEXT,
+    name             TEXT,
+    ai_title         TEXT,
+    first_prompt     TEXT,
+    last_prompt      TEXT,
+    note             TEXT,
+    state            TEXT NOT NULL DEFAULT 'open',
+    live             TEXT NOT NULL DEFAULT 'detached',
+    live_detail      TEXT,
+    kind             TEXT,
+    bg_id            TEXT,
+    linked_to        TEXT,
+    created_at       INTEGER,
+    last_activity_at INTEGER,
+    done_at          INTEGER,
+    pid              INTEGER,
+    gh_ref           TEXT,
+    gh_url           TEXT,
+    gh_login         TEXT,
+    gh_scanned       INTEGER,
+    gh_checked_at    INTEGER,
+    pr_ref           TEXT,
+    pr_state         TEXT,
+    pr_rollup        TEXT,
+    pr_event         TEXT,
+    pr_event_at      INTEGER,
+    pr_alert         TEXT,
+    pr_checked_at    INTEGER,
+    thread_id        TEXT
+);
+CREATE TABLE IF NOT EXISTS steps (
+    id         INTEGER PRIMARY KEY,
+    thread_id  TEXT NOT NULL,
+    pos        INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'manual',
+    cond       TEXT,
+    detail     TEXT,
+    created_at INTEGER,
+    checked_at INTEGER,
+    done_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS steps_by_thread ON steps (thread_id, pos);
+"""
+# Columns added after the first release; connect() adds them to older databases.
+ADDED_COLUMNS = {
+    "pid": "INTEGER",
+    "gh_ref": "TEXT",
+    "gh_url": "TEXT",
+    "gh_login": "TEXT",
+    "gh_scanned": "INTEGER",
+    "gh_checked_at": "INTEGER",
+    "pr_ref": "TEXT",
+    "pr_state": "TEXT",
+    "pr_rollup": "TEXT",
+    "pr_event": "TEXT",
+    "pr_event_at": "INTEGER",
+    "pr_alert": "TEXT",
+    "pr_checked_at": "INTEGER",
+    "thread_id": "TEXT",
+}
+# A session continues the thread of the one it was cleared from; the first session of a thread names it.
+THREAD = "coalesce(items.thread_id, items.session_id)"
+# The thread's next step is the user's and the one before it was a wait that has just come through.
+STEP_READY = f"""EXISTS (
+    SELECT 1 FROM steps n JOIN steps w ON w.thread_id = n.thread_id AND w.pos = n.pos - 1
+    WHERE n.thread_id = {THREAD} AND n.kind = 'manual' AND n.done_at IS NULL
+      AND w.kind != 'manual' AND w.done_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM steps e WHERE e.thread_id = n.thread_id AND e.pos < n.pos AND e.done_at IS NULL))"""
+PENDING = f"EXISTS (SELECT 1 FROM steps p WHERE p.thread_id = {THREAD} AND p.done_at IS NULL)"
+# A merged or closed PR is expected, not news, while the thread still has steps after it.
+ALERT = f"pr_alert IS NOT NULL AND NOT (pr_alert IN ('merged', 'closed') AND {PENDING})"
+NEEDS_YOU = f"state = 'open' AND (live IN ('waiting', 'idle') OR (live = 'detached' AND (({ALERT}) OR {STEP_READY})))"
+MENU_SECTIONS = (
+    ("Needs you", NEEDS_YOU),
+    ("Working", "state = 'open' AND live = 'working'"),
+    ("Open, no tab", f"state = 'open' AND live = 'detached' AND NOT ({NEEDS_YOU})"),
+)
+PR_REF = re.compile(r"^[\w.-]+/[\w.-]+#\d+$")
+RELEASE_REF = re.compile(r"^[\w.-]+/[\w.-]+(@\S+)?$")
+
+
+def connect() -> sqlite3.Connection:
+    os.umask(0o077)  # the ledger holds prompt text, so its files are private to this user
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=5)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(SCHEMA)
+    have = {r[1] for r in db.execute("PRAGMA table_info(items)")}
+    for col, typ in ADDED_COLUMNS.items():
+        if col not in have:
+            db.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
+    return db
+
+
+def thread_of(row) -> str:
+    return row["thread_id"] or row["session_id"]
+
+
+def title(row) -> str:
+    return row["name"] or row["ai_title"] or row["first_prompt"] or row["session_id"][:8]
+
+
+def find_transcript(session_id: str, hint: str | None = None) -> Path | None:
+    if hint and Path(hint).exists():
+        return Path(hint)
+    return next(PROJECTS.glob(f"*/{session_id}.jsonl"), None)
+
+
+def typed_text(rec: dict) -> str | None:
+    """Text a person typed in a user record; None for tool results, injected context and skill text."""
+    if rec.get("isMeta") or rec.get("isCompactSummary"):
+        return None
+    content = rec.get("message", {}).get("content")
+    if isinstance(content, list):  # a prompt with pasted images
+        content = " ".join(part.get("text", "") for part in content if part.get("type") == "text")
+    if not isinstance(content, str) or content.startswith("<") or not content.strip():
+        return None
+    return content
+
+
+def scan_transcript(path: Path, tail_bytes: int | None = None) -> dict:
+    """Pull titles, prompts, cwd, branch and timestamps out of a transcript."""
+    info: dict = {}
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if tail_bytes and size > tail_bytes:
+            f.seek(size - tail_bytes)
+            f.readline()
+        for raw in f:
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            t = rec.get("type")
+            if t == "custom-title":
+                info["name"] = rec.get("customTitle")
+            elif t == "ai-title":
+                info["ai_title"] = rec.get("aiTitle")
+            elif t == "last-prompt":
+                info["last_prompt"] = rec.get("lastPrompt")
+            elif t == "pr-link" and rec.get("prRepository") and rec.get("prNumber"):
+                info["pr_ref"] = f"{rec['prRepository']}#{rec['prNumber']}"
+            elif t == "user" and (text := typed_text(rec)):
+                info.setdefault("first_prompt", " ".join(text.split())[:300])
+            if rec.get("cwd"):
+                info.setdefault("cwd", rec["cwd"])
+            if rec.get("gitBranch"):
+                info["git_branch"] = rec["gitBranch"]
+            if ts := rec.get("timestamp"):
+                info.setdefault("first_ts", ts)
+    info["mtime"] = int(path.stat().st_mtime)
+    return info
+
+
+def iso_to_epoch(ts: str) -> int:
+    from datetime import datetime
+
+    return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+
+
+def live_sessions() -> list[dict] | None:
+    """Sessions Claude Code reports as running, or None when it can't say (failed, timed out, not on PATH)."""
+    try:
+        out = subprocess.run(
+            [shutil.which("claude") or "claude", "agents", "--json", "--all"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=20,
+            creationflags=winplatform.NO_WINDOW,
+        )
+        data = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        data = None
+    return data if isinstance(data, list) else None
+
+
+def live_state(agent: dict) -> str:
+    # Background sessions report a `state`; interactive ones, and background ones without a job, report `status`.
+    if agent.get("kind") == "background" and "state" in agent:
+        return {"working": "working", "blocked": "waiting"}.get(agent["state"], "detached")
+    return {"busy": "working", "waiting": "waiting", "idle": "idle"}.get(agent.get("status"), "working")
+
+
+def cmd_snapshot(args=None) -> None:
+    db = connect()
+    now = int(time.time())
+    agents = live_sessions()
+    if agents is None:
+        # Reconciling against nothing would flip every live session to detached.
+        print("claude agents unavailable, skipping the live-state reconcile", file=sys.stderr)
+    seen = set()
+    for agent in agents or []:
+        sid = agent.get("sessionId")
+        if not sid:
+            continue
+        live = live_state(agent)
+        if live == "detached":
+            # Finished background sessions: only enrich rows we already track.
+            db.execute(
+                "UPDATE items SET kind = ?, bg_id = ? WHERE session_id = ?", (agent.get("kind"), agent.get("id"), sid)
+            )
+            continue
+        seen.add(sid)
+        db.execute(
+            """INSERT INTO items (session_id, cwd, kind, bg_id, pid, live, live_detail, state,
+                                  created_at, last_activity_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+               ON CONFLICT (session_id) DO UPDATE SET
+                 cwd = coalesce(cwd, excluded.cwd), kind = excluded.kind, bg_id = excluded.bg_id, pid = excluded.pid,
+                 live = excluded.live,
+                 live_detail = CASE WHEN excluded.live = 'waiting' THEN coalesce(excluded.live_detail, live_detail) END,
+                 state = CASE WHEN state = 'stale' AND excluded.live != 'detached' THEN 'open' ELSE state END""",
+            (
+                sid,
+                agent.get("cwd"),
+                agent.get("kind"),
+                agent.get("id"),
+                agent.get("pid"),
+                live,
+                agent.get("waitingFor"),
+                agent.get("startedAt", now * 1000) // 1000,
+                now,
+            ),
+        )
+    # Anything the hooks think is live but claude no longer lists has gone away (tab closed, reboot).
+    for row in db.execute(f"SELECT session_id FROM items WHERE live IN {LIVE_STATES}").fetchall():
+        if agents is not None and row["session_id"] not in seen:
+            db.execute(
+                "UPDATE items SET live = 'detached', live_detail = NULL WHERE session_id = ?", (row["session_id"],)
+            )
+    # Refresh titles for anything touched in the last two days.
+    for row in db.execute(
+        "SELECT session_id, transcript_path, coalesce(pr_ref, gh_ref) AS status_ref FROM items "
+        "WHERE last_activity_at > ? OR live != 'detached'",
+        (now - 2 * 86400,),
+    ).fetchall():
+        path = find_transcript(row["session_id"], row["transcript_path"])
+        if not path:
+            continue
+        info = scan_transcript(path, tail_bytes=1_000_000)
+        if info.get("pr_ref") and info["pr_ref"] != row["status_ref"]:
+            # The session moved on to another PR: drop the old status so the new one is polled right away.
+            db.execute(
+                "UPDATE items SET pr_state = NULL, pr_rollup = NULL, pr_event = NULL, pr_event_at = NULL, "
+                "pr_alert = NULL, pr_checked_at = NULL WHERE session_id = ?",
+                (row["session_id"],),
+            )
+        db.execute(
+            """UPDATE items SET transcript_path = ?, name = coalesce(?, name), ai_title = coalesce(?, ai_title),
+                 last_prompt = coalesce(?, last_prompt), git_branch = coalesce(?, git_branch),
+                 pr_ref = coalesce(?, pr_ref), last_activity_at = max(coalesce(last_activity_at, 0), ?)
+               WHERE session_id = ?""",
+            (
+                str(path),
+                info.get("name"),
+                info.get("ai_title"),
+                info.get("last_prompt"),
+                info.get("git_branch"),
+                info.get("pr_ref"),
+                info["mtime"],
+                row["session_id"],
+            ),
+        )
+    db.commit()
+    import github
+
+    if not github.token():
+        print("no GitHub token found, skipping avatars and PR status", file=sys.stderr)
+        return
+    try:
+        github.refresh(db)
+        github.refresh_status(db)
+    except (OSError, ValueError) as e:
+        # A timeout's message can embed the whole GraphQL query; one short line per minute is enough for the log.
+        reason = "GitHub timed out" if isinstance(e, TimeoutError) else str(e)[:200]
+        print(f"GitHub refresh skipped: {reason}", file=sys.stderr)
+
+
+def cmd_backfill(args) -> None:
+    db = connect()
+    cutoff = time.time() - args.days * 86400
+    added = 0
+    for path in PROJECTS.glob("*/*.jsonl"):
+        if path.stat().st_mtime < cutoff:
+            continue
+        sid = path.stem
+        if db.execute("SELECT 1 FROM items WHERE session_id = ?", (sid,)).fetchone():
+            continue
+        info = scan_transcript(path)
+        if not info.get("first_prompt"):
+            continue
+        created = iso_to_epoch(info["first_ts"]) if info.get("first_ts") else info["mtime"]
+        db.execute(
+            """INSERT INTO items (session_id, cwd, transcript_path, git_branch, name, ai_title, first_prompt,
+                                  last_prompt, pr_ref, state, live, created_at, last_activity_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'stale', 'detached', ?, ?)""",
+            (
+                sid,
+                info.get("cwd"),
+                str(path),
+                info.get("git_branch"),
+                info.get("name"),
+                info.get("ai_title"),
+                info.get("first_prompt"),
+                info.get("last_prompt"),
+                info.get("pr_ref"),
+                created,
+                info["mtime"],
+            ),
+        )
+        added += 1
+    db.commit()
+    print(f"backfilled {added} sessions as stale")
+    cmd_snapshot(args)
+
+
+def resolve(db, ref: str | None) -> sqlite3.Row:
+    ref = ref or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not ref:
+        sys.exit("no session given and not inside a Claude Code session")
+    rows = db.execute(
+        "SELECT * FROM items WHERE session_id LIKE ? OR bg_id = ? OR name = ?", (ref + "%", ref, ref)
+    ).fetchall()
+    if len(rows) != 1:
+        sys.exit(f"{len(rows)} sessions match {ref!r}")
+    return rows[0]
+
+
+def set_state(args, state: str) -> None:
+    db = connect()
+    row = resolve(db, args.session)
+    db.execute(
+        "UPDATE items SET state = ?, done_at = ?, note = coalesce(?, note) WHERE session_id = ?",
+        (state, int(time.time()) if state == "done" else None, args.note, row["session_id"]),
+    )
+    db.commit()
+    print(f"{state}: {title(row)}")
+
+
+def cmd_note(args) -> None:
+    db = connect()
+    row = resolve(db, args.session)
+    db.execute("UPDATE items SET note = ? WHERE session_id = ?", (args.text or None, row["session_id"]))
+    db.commit()
+
+
+def cmd_link(args) -> None:
+    db = connect()
+    row = resolve(db, args.session)
+    other = resolve(db, args.other)
+    db.execute("UPDATE items SET linked_to = ? WHERE session_id = ?", (other["session_id"], row["session_id"]))
+    db.commit()
+    print(f"{title(row)} -> {title(other)}")
+
+
+def cmd_ref(args) -> None:
+    """Set the PR or issue a session is about by hand, when the first link in its prompts was only an example."""
+    import github
+
+    if args.ref == "none":
+        ref = url = None
+    elif m := github.REF_URL.search(args.ref):
+        ref, url = f"{m[1]}#{m[3]}", f"https://{m[0]}"
+    elif PR_REF.match(args.ref):
+        ref, url = args.ref, None
+    else:
+        sys.exit(f"expected a GitHub PR or issue URL, owner/repo#N or none, got {args.ref!r}")
+    db = connect()
+    row = resolve(db, args.session)
+    # gh_scanned = 2 keeps the hook and the transcript scan from putting their own guess back.
+    db.execute(
+        "UPDATE items SET gh_ref = ?, gh_url = ?, gh_scanned = 2, gh_login = NULL, gh_checked_at = NULL, "
+        "pr_state = NULL, pr_rollup = NULL, pr_event = NULL, pr_event_at = NULL, pr_alert = NULL, "
+        "pr_checked_at = NULL WHERE session_id = ?",
+        (ref, url, row["session_id"]),
+    )
+    db.commit()
+    print(f"{title(row)} -> {ref or 'no PR or issue'}")
+
+
+def cmd_split(args) -> None:
+    """Start a thread of its own for a session that /clear joined to work it has nothing to do with."""
+    db = connect()
+    row = resolve(db, args.session)
+    old = thread_of(row)
+    if old == row["session_id"]:
+        sys.exit(f"{title(row)} already starts its own thread")
+    db.execute(
+        "UPDATE items SET thread_id = NULL, note = NULL, gh_ref = NULL, gh_url = NULL, gh_login = NULL, "
+        "gh_scanned = NULL, pr_ref = NULL, pr_state = NULL, pr_rollup = NULL, pr_event = NULL, pr_event_at = NULL, "
+        "pr_alert = NULL, pr_checked_at = NULL WHERE session_id = ?",
+        (row["session_id"],),
+    )
+    # The thread it left keeps its steps; bring back its latest session so the work has a card again.
+    db.execute(
+        f"UPDATE items SET state = 'open' WHERE session_id = (SELECT session_id FROM items WHERE {THREAD} = ? "
+        "AND state = 'cleared' ORDER BY last_activity_at DESC LIMIT 1)",
+        (old,),
+    )
+    db.commit()
+    print(f"{title(row)} now starts its own thread")
+
+
+def step_rows(db, thread: str) -> list[sqlite3.Row]:
+    return db.execute("SELECT * FROM steps WHERE thread_id = ? ORDER BY pos", (thread,)).fetchall()
+
+
+def print_steps(db, thread: str) -> None:
+    steps = step_rows(db, thread)
+    if not steps:
+        print("no steps")
+        return
+    for s in steps:
+        wait = " (waits)" if s["kind"] != "manual" and not s["done_at"] else ""
+        detail = f" ({s['detail']})" if s["detail"] else ""
+        print(f"{s['pos']}. [{'x' if s['done_at'] else ' '}] {s['title']}{wait}{detail}")
+    print(f"{sum(1 for s in steps if s['done_at'])}/{len(steps)} done")
+
+
+def find_step(db, thread: str, pos: int) -> sqlite3.Row:
+    step = db.execute("SELECT * FROM steps WHERE thread_id = ? AND pos = ?", (thread, pos)).fetchone()
+    if not step:
+        sys.exit(f"no step {pos}")
+    return step
+
+
+def cmd_step_add(args) -> None:
+    db = connect()
+    thread = thread_of(resolve(db, args.session))
+    if args.pr:
+        if not PR_REF.match(args.pr):
+            sys.exit("--pr takes owner/repo#123")
+        kind, cond, default = "pr_merged", args.pr, f"{args.pr} merged"
+    elif args.release:
+        if not RELEASE_REF.match(args.release):
+            sys.exit("--release takes owner/repo, or owner/repo@<tag pattern> such as owner/repo@v2.*")
+        repo, _, pattern = args.release.partition("@")
+        kind, cond, default = "release", args.release, f"{repo} released" + (f" ({pattern})" if pattern else "")
+    else:
+        if not args.title:
+            sys.exit("a step needs a title, --pr or --release")
+        kind, cond, default = "manual", None, args.title
+    db.execute(
+        "INSERT INTO steps (thread_id, pos, title, kind, cond, created_at) "
+        "VALUES (?, (SELECT coalesce(max(pos), 0) + 1 FROM steps WHERE thread_id = ?), ?, ?, ?, ?)",
+        (thread, thread, " ".join((args.title or default).split()), kind, cond, int(time.time())),
+    )
+    db.commit()
+    print_steps(db, thread)
+
+
+def cmd_step_done(args, done: bool) -> None:
+    db = connect()
+    thread = thread_of(resolve(db, args.session))
+    step = find_step(db, thread, args.n)
+    db.execute("UPDATE steps SET done_at = ? WHERE id = ?", (int(time.time()) if done else None, step["id"]))
+    db.commit()
+    print_steps(db, thread)
+
+
+def cmd_step_rm(args) -> None:
+    db = connect()
+    thread = thread_of(resolve(db, args.session))
+    step = find_step(db, thread, args.n)
+    db.execute("DELETE FROM steps WHERE id = ?", (step["id"],))
+    db.execute("UPDATE steps SET pos = pos - 1 WHERE thread_id = ? AND pos > ?", (thread, step["pos"]))
+    db.commit()
+    print_steps(db, thread)
+
+
+def cmd_step_ls(args) -> None:
+    db = connect()
+    print_steps(db, thread_of(resolve(db, args.session)))
+
+
+def age(epoch: int | None) -> str:
+    if not epoch:
+        return "?"
+    s = int(time.time()) - epoch
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{s // n}{unit}"
+    return f"{s}s"
+
+
+def cmd_ls(args) -> None:
+    db = connect()
+    states = ("open", "parked", "stale", "done") if args.all else ("open", "parked")
+    rows = db.execute(
+        f"SELECT * FROM items WHERE state IN ({','.join('?' * len(states))}) "
+        "ORDER BY live = 'waiting' DESC, live = 'idle' DESC, live = 'working' DESC, last_activity_at DESC",
+        states,
+    ).fetchall()
+    progress = {
+        r["thread_id"]: f" [{r['done']}/{r['total']}]"
+        for r in db.execute("SELECT thread_id, count(done_at) AS done, count(*) AS total FROM steps GROUP BY thread_id")
+    }
+    for r in rows:
+        repo = Path(r["cwd"] or "?").name
+        print(
+            f"{r['session_id'][:8]}  {r['state']:<6} {r['live']:<8} {age(r['last_activity_at']):>4}  "
+            f"{repo:<22.22} {title(r)[:70]}{progress.get(thread_of(r), '')}"
+        )
+
+
+def resume_text(row) -> str:
+    if row["kind"] == "background" and row["bg_id"]:
+        return f"claude attach {row['bg_id']}"
+    return f"claude --resume {row['session_id']}"
+
+
+def resume_command(row) -> str:
+    """The resume command for a cmd prompt, for the board's copy button."""
+    return f'cd /d "{row["cwd"]}" && {resume_text(row)}'
+
+
+def focus_tab(row) -> str:
+    """Bring the VS Code terminal running a live interactive session to the front, matched by its shell's pid."""
+    if not row["pid"]:
+        return "no pid recorded yet"
+    chain = winplatform.ancestors(row["pid"], winplatform.process_parents())
+    windows = vscode_bridge.load_windows()
+    match = vscode_bridge.window_for_pid(windows, chain)
+    if not match:
+        fallback = vscode_bridge.window_for_folder(windows, row["cwd"] or "")
+        if fallback and fallback.folders:
+            if problem := vscode_bridge.raise_window(fallback.folders[0]):
+                return problem
+            return "terminal not found; raised the VS Code window for its folder"
+        return "no VS Code window has this session's terminal"
+    window, shell_pid = match
+    if window.folders and (problem := vscode_bridge.raise_window(window.folders[0])):
+        return problem
+    result = vscode_bridge.send_request({"kind": "focus", "shellPid": shell_pid}, window.window_id)
+    return "focused" if result == "ok" else result
+
+
+def resume(row) -> str:
+    """Open the session in a new VS Code terminal. Refuses when an interactive terminal already has it."""
+    if row["live"] in LIVE_STATES and row["kind"] != "background":
+        return "already open in another tab"
+    if not row["cwd"]:
+        return "no cwd recorded"
+    if not Path(row["cwd"]).is_dir():
+        return f"folder no longer exists: {row['cwd']}"
+    window = vscode_bridge.window_for_folder(vscode_bridge.load_windows(), row["cwd"])
+    problem = vscode_bridge.raise_window(window.folders[0] if window else row["cwd"])
+    # An open window's extension can take the request without the code command.
+    result = (
+        problem
+        if problem and window is None
+        else vscode_bridge.send_request(
+            {"kind": "resume", "cwd": row["cwd"], "text": resume_text(row)},
+            window.window_id if window else None,
+            # A window that has to start first needs longer before its extension is listening.
+            wait=5 if window else 20,
+        )
+    )
+    if result == "ok":
+        return "opened"
+    winplatform.copy_to_clipboard(resume_command(row))
+    return f"{result}; the resume command is on your clipboard"
+
+
+def report(result: str) -> None:
+    """Print the outcome for the log, and show it in a dialog when there is no console to read it from."""
+    print(result)
+    if sys.__stdout__ is None and result not in ("opened", "focused"):
+        winplatform.notify(result)
+
+
+def resolve_or_notify(db, ref: str | None) -> sqlite3.Row:
+    try:
+        return resolve(db, ref)
+    except SystemExit as e:
+        if sys.__stdout__ is None and isinstance(e.code, str):
+            winplatform.notify(e.code)
+        raise
+
+
+def cmd_resume(args) -> None:
+    db = connect()
+    row = resolve(db, args.session)
+    if args.print:
+        print(resume_command(row))
+    else:
+        print(resume(row))
+
+
+def cmd_go(args) -> None:
+    db = connect()
+    row = resolve_or_notify(db, args.session)
+    live = row["live"] in LIVE_STATES and row["kind"] != "background"
+    report(focus_tab(row) if live else resume(row))
+
+
+LINK = re.compile(r"cc-hud:(go|resume)/([0-9a-f-]{8,})/?")
+
+
+def parse_link(link: str) -> tuple[str, str]:
+    if not (m := LINK.fullmatch(link)):
+        raise ValueError(f"not a cc-hud link: {link!r}")
+    return m[1], m[2]
+
+
+def cmd_open_link(args) -> None:
+    """Run Go or Resume from a cc-hud: link, so the click's right to bring a window forward reaches VS Code."""
+    try:
+        action, session = parse_link(args.link)
+    except ValueError as e:
+        sys.exit(str(e))
+    with contextlib.closing(connect()) as db:
+        row = resolve_or_notify(db, session)
+    live = row["live"] in LIVE_STATES and row["kind"] != "background"
+    report(focus_tab(row) if action == "go" and live else resume(row))
+
+
+def cmd_set_webhook(args) -> None:
+    import getpass
+
+    import teams
+
+    try:
+        url = teams.validate_webhook(getpass.getpass("Teams Workflows webhook URL (input hidden): "))
+    except ValueError as e:
+        sys.exit(str(e))
+    winplatform.write_credential(teams.CREDENTIAL, url)
+    print(f"stored in Credential Manager as {teams.CREDENTIAL!r}")
+
+
+def menu(db) -> dict:
+    """What the tray icon shows: the Needs you count, whether anything waits on a prompt, and the three groups."""
+    sections = []
+    for heading, where in MENU_SECTIONS:
+        rows = db.execute(
+            f"SELECT * FROM items WHERE {where} ORDER BY live = 'waiting' DESC, last_activity_at"
+        ).fetchall()
+        items = [
+            {
+                "id": r["session_id"],
+                "title": " ".join(title(r).split())[:60],
+                "age": age(r["last_activity_at"]),
+                "live": r["live"],
+                "detail": r["live_detail"] or r["pr_event"] or "",
+                "alert": r["pr_alert"],
+            }
+            for r in rows
+        ]
+        sections.append({"heading": heading, "items": items})
+    count = lambda where: db.execute(f"SELECT count(*) FROM items WHERE {where}").fetchone()[0]  # noqa: E731
+    return {
+        "needs": len(sections[0]["items"]),
+        "waiting": count("state = 'open' AND live = 'waiting'"),
+        "open": count("state = 'open'"),
+        "board": f"{BOARD_URL}/#t={token()}",
+        "sections": sections,
+    }
+
+
+def cmd_menu(args) -> None:
+    with contextlib.closing(connect()) as db:
+        print(json.dumps(menu(db), ensure_ascii=False))
+
+
+def cmd_digest(args) -> None:
+    db = connect()
+    now = int(time.time())
+    needs = db.execute(
+        "SELECT * FROM items WHERE state = 'open' AND live IN ('waiting', 'idle') AND last_activity_at < ? "
+        "ORDER BY last_activity_at",
+        (now - args.waiting_hours * 3600,),
+    ).fetchall()
+    # A thread whose next step is a wait is being watched, not forgotten.
+    cold = db.execute(
+        "SELECT * FROM items WHERE state = 'open' AND live = 'detached' AND last_activity_at < ? "
+        f"AND coalesce((SELECT kind FROM steps WHERE thread_id = {THREAD} AND done_at IS NULL ORDER BY pos LIMIT 1), "
+        "'manual') = 'manual' ORDER BY last_activity_at",
+        (now - args.cold_hours * 3600,),
+    ).fetchall()
+    if not needs and not cold:
+        return
+
+    def line(r) -> str:
+        # Only titles go to Teams, never prompt text.
+        name = " ".join((r["name"] or r["ai_title"] or f"untitled session {r['session_id'][:8]}").split())[:90]
+        return f"{name} ({Path(r['cwd'] or '?').name}, {age(r['last_activity_at'])})"
+
+    sections = [("Waiting on you", [line(r) for r in needs]), ("Open but untouched", [line(r) for r in cold])]
+    if args.dry_run:
+        for heading, lines in sections:
+            if lines:
+                print(f"{heading} ({len(lines)})")
+                print("\n".join(f"- {text}" for text in lines))
+        print(f"Board: {BOARD_URL}")
+        return
+    import teams
+
+    title = teams.headline(waiting=len(needs), untouched=len(cold))
+    teams.post(teams.build_card(sections, BOARD_URL, title), teams.webhook())
+
+
+def token() -> str:
+    """The per-install secret the board API asks for, created on first use and readable only by this user."""
+    if not TOKEN_PATH.exists():
+        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_urlsafe(32))
+    return TOKEN_PATH.read_text().strip()
+
+
+def cmd_board(args) -> None:
+    url = f"{BOARD_URL}/#t={token()}"
+    if args.print:
+        print(url)
+    else:
+        os.startfile(url)
+
+
+def cmd_serve(args) -> None:
+    from server import serve
+
+    serve(args.port)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="hud")
+    sub = p.add_subparsers(required=True)
+
+    s = sub.add_parser("ls", help="list open and parked sessions")
+    s.add_argument("-a", "--all", action="store_true", help="include stale and done")
+    s.set_defaults(func=cmd_ls)
+
+    for name, state in (("done", "done"), ("park", "parked"), ("open", "open")):
+        s = sub.add_parser(name, help=f"mark a session {state} (default: the current one)")
+        s.add_argument("session", nargs="?")
+        s.add_argument("-m", "--note")
+        s.set_defaults(func=lambda a, st=state: set_state(a, st))
+
+    s = sub.add_parser("note", help="set a note on a session")
+    s.add_argument("text")
+    s.add_argument("-s", "--session")
+    s.set_defaults(func=cmd_note)
+
+    s = sub.add_parser("link", help="link a session to the one it works for (e.g. a reviewer tab)")
+    s.add_argument("other")
+    s.add_argument("-s", "--session")
+    s.set_defaults(func=cmd_link)
+
+    s = sub.add_parser("ref", help="set the PR or issue a session is about, when the guess from its prompts is wrong")
+    s.add_argument("ref", help="a GitHub PR or issue URL, owner/repo#N, or none")
+    s.add_argument("-s", "--session")
+    s.set_defaults(func=cmd_ref)
+
+    s = sub.add_parser("split", help="take a session out of the thread /clear joined it to")
+    s.add_argument("session", nargs="?")
+    s.set_defaults(func=cmd_split)
+
+    s = sub.add_parser("step", help="the steps left in this piece of work, kept across /clear")
+    steps = s.add_subparsers(required=True)
+    t = steps.add_parser("add", help="add a step at the end")
+    t.add_argument("title", nargs="?")
+    wait = t.add_mutually_exclusive_group()
+    wait.add_argument("--pr", metavar="OWNER/REPO#N", help="done by itself when this PR is merged")
+    wait.add_argument(
+        "--release", metavar="OWNER/REPO[@PATTERN]", help="done by itself when the repo publishes its next release"
+    )
+    t.set_defaults(func=cmd_step_add)
+    for name, done in (("done", True), ("undo", False)):
+        t = steps.add_parser(name, help=f"mark step N {'done' if done else 'not done'}")
+        t.add_argument("n", type=int)
+        t.set_defaults(func=lambda a, d=done: cmd_step_done(a, d))
+    t = steps.add_parser("rm", help="remove step N")
+    t.add_argument("n", type=int)
+    t.set_defaults(func=cmd_step_rm)
+    t = steps.add_parser("ls", help="list the steps")
+    t.set_defaults(func=cmd_step_ls)
+    for t in steps.choices.values():
+        t.add_argument("-s", "--session", help="a session in the thread (default: the current one)")
+
+    s = sub.add_parser("resume", help="open a session in a new VS Code terminal")
+    s.add_argument("session")
+    s.add_argument("-p", "--print", action="store_true", help="print the command instead")
+    s.set_defaults(func=cmd_resume)
+
+    s = sub.add_parser("go", help="focus the session's tab, or resume it in a new one")
+    s.add_argument("session")
+    s.set_defaults(func=cmd_go)
+
+    s = sub.add_parser("open-link", help="handle a cc-hud: link from the board")
+    s.add_argument("link")
+    s.set_defaults(func=cmd_open_link)
+
+    s = sub.add_parser("snapshot", help="reconcile with live sessions and refresh titles")
+    s.set_defaults(func=cmd_snapshot)
+
+    s = sub.add_parser("backfill", help="import recent transcripts as stale")
+    s.add_argument("--days", type=int, default=30)
+    s.set_defaults(func=cmd_backfill)
+
+    s = sub.add_parser("menu", help="the tray icon's menu, as JSON")
+    s.set_defaults(func=cmd_menu)
+
+    s = sub.add_parser("digest", help="post open loops to Teams")
+    s.add_argument("--waiting-hours", type=float, default=1)
+    s.add_argument("--cold-hours", type=float, default=24)
+    s.add_argument("-n", "--dry-run", action="store_true")
+    s.set_defaults(func=cmd_digest)
+
+    s = sub.add_parser("set-webhook", help="store the Teams webhook in Windows Credential Manager")
+    s.set_defaults(func=cmd_set_webhook)
+
+    s = sub.add_parser("board", help="open the board in the browser, signed in")
+    s.add_argument("-p", "--print", action="store_true", help="print the URL instead")
+    s.set_defaults(func=cmd_board)
+
+    s = sub.add_parser("serve", help="run the web board")
+    s.add_argument("--port", type=int, default=7777)
+    s.set_defaults(func=cmd_serve)
+
+    args = p.parse_args()
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper) and not stream.isatty():
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    winplatform.log_when_windowless(DB_PATH.parent / f"{sys.argv[1]}.log")
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

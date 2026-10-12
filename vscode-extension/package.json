@@ -1,0 +1,12 @@
+{
+  "name": "cc-hud-win",
+  "displayName": "cc-hud",
+  "description": "Lets the cc-hud session board find and open Claude Code terminals.",
+  "version": "0.1.0",
+  "publisher": "karimalbeni",
+  "license": "MIT",
+  "engines": { "vscode": "^1.90.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {}
+}

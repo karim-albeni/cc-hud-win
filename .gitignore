@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+dist/
+*.db
+*.db-wal
+*.db-shm
+*.log
+token
+.superpowers/

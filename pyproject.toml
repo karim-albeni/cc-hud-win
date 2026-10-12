@@ -1,0 +1,23 @@
+[project]
+name = "cc-hud-win"
+version = "0.0.0"
+description = "A session board for Claude Code sessions, for Windows"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+ruff = "0.16.10"
+ty = "0.0.85"
+
+[tool.ruff]
+extend-exclude = ["docs"]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PLW"]
