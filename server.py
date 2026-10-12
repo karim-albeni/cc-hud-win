@@ -70,7 +70,9 @@ class Handler(BaseHTTPRequestHandler):
     def _signed_in(self) -> bool:
         # The page itself holds no data; everything behind it needs the per-install token, which only this user
         # can read. Anything else that reaches the port, like a container, gets nothing.
-        return hmac.compare_digest(self.headers.get("X-HUD-Token", ""), self.token)
+        # Compared as bytes: compare_digest raises on non-ASCII str, and an empty token must never match.
+        given = self.headers.get("X-HUD-Token", "").encode()
+        return bool(self.token) and hmac.compare_digest(given, self.token.encode())
 
     def _send(self, code: int, body, ctype="application/json"):
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -176,4 +178,6 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(port: int) -> None:
     Handler.token = hud.token()
+    if not Handler.token:
+        raise RuntimeError(f"the board token in {hud.TOKEN_PATH} is empty; delete the file and start the board again")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

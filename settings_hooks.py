@@ -6,6 +6,7 @@ Usage: settings_hooks.py add <settings.json> <python> <hook> [--db <path>]
 
 import copy
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -76,9 +77,13 @@ def main(argv: list[str]) -> int:
     else:
         updated = remove_ours(settings)
     output = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
-    # Written in place rather than replaced, so a symlinked settings.json and its permissions survive.
-    with path.open("w", encoding="utf-8", newline="\n") as f:
+    # Written next to the real file and swapped in, so a crash mid-write never leaves settings.json empty.
+    # Resolving first keeps a symlinked settings.json (dotfiles) pointing at the updated file.
+    target = path.resolve()
+    staging = target.with_name(f"{target.name}.cc-hud.tmp")
+    with staging.open("w", encoding="utf-8", newline="\n") as f:
         f.write(output)
+    os.replace(staging, target)
     return 0
 
 

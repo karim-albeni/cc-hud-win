@@ -735,12 +735,26 @@ def cmd_digest(args) -> None:
 
 
 def token() -> str:
-    """The per-install secret the board API asks for, created on first use and readable only by this user."""
-    if not TOKEN_PATH.exists():
-        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(secrets.token_urlsafe(32))
+    """The per-install secret the board API asks for, created on first use.
+
+    It is private because it lives in the user profile; Windows ignores the POSIX file mode.
+    """
+    try:
+        existing = TOKEN_PATH.read_text().strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        return existing
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    staging = TOKEN_PATH.with_name(f"{TOKEN_PATH.name}.{os.getpid()}.tmp")
+    staging.write_text(secrets.token_urlsafe(32))
+    # The token appears whole or not at all, so the board never starts with an empty one. os.rename refuses an
+    # existing target on Windows, so when two processes race the first token wins and both end up using it.
+    TOKEN_PATH.unlink(missing_ok=True)
+    try:
+        os.rename(staging, TOKEN_PATH)
+    except FileExistsError:
+        staging.unlink()
     return TOKEN_PATH.read_text().strip()
 
 

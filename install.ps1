@@ -37,6 +37,7 @@ if ($Uninstall) {
   }
   Remove-Item 'HKCU:\Software\Classes\cc-hud' -Recurse -ErrorAction SilentlyContinue
   if (Get-Command code -ErrorAction SilentlyContinue) { & code --uninstall-extension karimalbeni.cc-hud-win | Out-Null }
+  & cmdkey.exe /delete:cc-hud-teams-webhook | Out-Null
   Write-Host "Uninstalled. Your data is still in $hudHome, and your settings from before the first install in $settings.bak-cc-hud."
   exit 0
 }
@@ -53,7 +54,7 @@ if ($env:HUD_DB -and $env:HUD_DB -ne $persistentDb) {
 Push-Location $repo
 try {
   Invoke-Checked 'poetry config' { poetry config virtualenvs.in-project true --local }
-  Invoke-Checked 'poetry install' { poetry install }
+  Invoke-Checked 'poetry install' { poetry install --without dev }
 } finally { Pop-Location }
 
 New-Item -ItemType Directory -Force $hudHome, $commands | Out-Null

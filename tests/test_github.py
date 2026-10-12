@@ -79,3 +79,18 @@ class ApiRequestTest(unittest.TestCase):
         ):
             self.assertIsNone(github.api_request("repos/a/b/issues/1"))
         self.assertIn("HTTP 404", err.getvalue())
+
+
+class RepoReferenceTest(unittest.TestCase):
+    def test_dot_segments_are_not_a_repository(self):
+        for ref in ("../x#1", "a/..#1", "./x#1", "a/.#1"):
+            with self.subTest(ref=ref):
+                self.assertIsNone(github.split_ref(ref))
+
+    def test_dotted_names_still_count(self):
+        self.assertEqual(github.split_ref("my.org/web.app#7"), ("my.org", "web.app", 7))
+
+    def test_person_asks_github_nothing_for_a_bad_reference(self):
+        with mock.patch.object(github, "gh_json") as asked:
+            self.assertIsNone(github.person("../x#1", None))
+        asked.assert_not_called()

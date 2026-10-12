@@ -97,8 +97,11 @@ def me() -> str | None:
 
 def person(ref: str, myself: str | None) -> str | None:
     """Whoever opened the PR or issue, or the first assignee when that was me."""
-    repo, number = ref.split("#")
-    data = gh_json(f"repos/{repo}/issues/{number}")
+    parsed = split_ref(ref)
+    if not parsed or parsed[2] is None:
+        return None
+    owner, name, number = parsed
+    data = gh_json(f"repos/{owner}/{name}/issues/{number}")
     if not data:
         return None
     ignore = ignored()
@@ -168,7 +171,8 @@ def avatar_path(login: str) -> Path | None:
     return path if path.is_file() else None
 
 
-REPO_PART = re.compile(r"^[\w.-]+$")
+# "." and ".." are path segments, not names: a ref built from them would send the token to another API path.
+REPO_PART = re.compile(r"^(?!\.\.?$)[\w.-]+$")
 FAST, SLOW, FINAL = 60, 900, 86400
 PRS_PER_QUERY = 20
 STEPS_PER_QUERY = 10

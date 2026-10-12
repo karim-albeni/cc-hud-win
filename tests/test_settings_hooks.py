@@ -96,3 +96,13 @@ class CliTest(unittest.TestCase):
             raw = path.read_bytes()
             self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
             self.assertEqual(json.loads(raw)["statusLine"], "Åsa")
+
+
+class AtomicWriteTest(unittest.TestCase):
+    def test_leaves_no_temporary_file_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text('{"theme": "dark"}', encoding="utf-8")
+            subprocess.run([sys.executable, str(SCRIPT), "add", str(path), PY, HOOK], check=True)
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["settings.json"])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["theme"], "dark")
